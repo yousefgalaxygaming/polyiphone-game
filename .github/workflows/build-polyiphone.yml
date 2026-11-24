@@ -235,25 +235,31 @@ jobs:
           cd "$GITHUB_WORKSPACE/build/ios"
           PROJ_FILE=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
 
-          rm -rf derived Payload
+          rm -rf build_out Payload
           xcodebuild build \
             -project "$PROJ_FILE" \
             -alltargets \
             -configuration Release \
             -sdk iphoneos \
             -arch arm64 \
-            -derivedDataPath derived \
+            CONFIGURATION_BUILD_DIR="$PWD/build_out" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-          APP_PATH=$(find derived/Build/Products/Release-iphoneos -maxdepth 2 -name "*.app" | head -n 1)
+          APP_PATH=$(find build_out -maxdepth 2 -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app produced in build_out"
+            exit 1
+          fi
+
           [ -f godot_apple_embedded.pck ] && cp godot_apple_embedded.pck "$APP_PATH/"
 
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
           zip -qry "$GITHUB_WORKSPACE/build/ios/polyiphone.ipa" Payload
-          rm -rf Payload derived
+          rm -rf Payload build_out
+          test -f "$GITHUB_WORKSPACE/build/ios/polyiphone.ipa"
 
       - name: Upload polyiphone.ipa
         if: always()
