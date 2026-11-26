@@ -234,6 +234,10 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/build/ios"
           PROJ_FILE=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
+          if [ -z "$PROJ_FILE" ]; then
+            echo "::error::No .xcodeproj found in $PWD"
+            exit 1
+          fi
 
           APPICON_DIR="$PWD/godot_apple_embedded/Images.xcassets/AppIcon.appiconset"
           mkdir -p "$APPICON_DIR"
@@ -241,6 +245,7 @@ jobs:
           import os, struct, zlib
 
           out_dir = os.environ["APPICON_DIR"]
+
           def make_png(w, h):
               def chunk(tag, data):
                   crc = zlib.crc32(tag + data) & 0xffffffff
@@ -289,18 +294,21 @@ jobs:
             exit 1
           fi
 
-          [ -f godot_apple_embedded.pck ] && cp godot_apple_embedded.pck "$APP_PATH/"
+          if [ -f godot_apple_embedded.pck ]; then
+            cp godot_apple_embedded.pck "$APP_PATH/"
+          fi
 
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
           zip -qry "$GITHUB_WORKSPACE/build/ios/polyiphone.ipa" Payload
           rm -rf Payload build_out
           test -f "$GITHUB_WORKSPACE/build/ios/polyiphone.ipa"
+          ls -lh "$GITHUB_WORKSPACE/build/ios/polyiphone.ipa"
+          
       - name: Upload polyiphone.ipa
         if: always()
         uses: actions/upload-artifact@v4
         with:
-        
           name: polyiphone-ipa
           path: build/ios/polyiphone.ipa
           if-no-files-found: error
