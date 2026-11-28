@@ -2,9 +2,22 @@ name: Build polyiphone IPA
 
 on: [workflow_dispatch]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: build-polyiphone
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: "4.7.2"
+  GODOT_TEMPLATE_TAG: "4.7.2.stable"
+  IOS_DIR: ${{ github.workspace }}/build/ios
+
 jobs:
   build-ios:
     runs-on: macos-15-intel
+    timeout-minutes: 240
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -12,18 +25,31 @@ jobs:
           lfs: true
 
       - name: Register PolyTouchControls Safely
+        shell: bash
         run: |
+          set -euo pipefail
           if [ ! -f "Polytoria/scripts/Mobile/PolyTouchControls.cs" ]; then
-            echo "ERROR: Polytoria/scripts/Mobile/PolyTouchControls.cs not found!"
+            echo "::error::Polytoria/scripts/Mobile/PolyTouchControls.cs not found!"
             exit 1
           fi
-          find Polytoria \( -name "*.cs" -o -name "*.tscn" \) -exec sed -i '' 's/Waiting for server\.\.\.//g' {} +
           sed -i '' '/PolyTouchControls=/d' Polytoria/project.godot
           if ! grep -q '^\[autoload\]' Polytoria/project.godot; then
             printf '\n[autoload]\n' >> Polytoria/project.godot
           fi
-          awk '/^\[autoload\]/ { print; print "PolyTouchControls=\"*res://scripts/Mobile/PolyTouchControls.cs\""; next } { print }' Polytoria/project.godot > Polytoria/project.godot.tmp && mv Polytoria/project.godot.tmp Polytoria/project.godot
+          awk '/^\[autoload\]/ { print; print "PolyTouchControls=\"*res://scripts/Mobile/PolyTouchControls.cs\""; next } { print }' \
+            Polytoria/project.godot > Polytoria/project.godot.tmp
+          mv Polytoria/project.godot.tmp Polytoria/project.godot
           grep -A 5 '^\[autoload\]' Polytoria/project.godot
+
+      - name: Patch Loading Screen (no "Waiting for server" screen)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/patch_loading_screen.py Polytoria/scripts/client/ui/UILoadingScreen.cs
+          if grep -rn "Waiting for server" Polytoria --include=*.cs --include=*.tscn; then
+            echo "::error::'Waiting for server' text is still present"
+            exit 1
+          fi
 
       - name: Setup .NET 10
         uses: actions/setup-dotnet@v4
@@ -54,261 +80,240 @@ jobs:
 
       - name: Build Patched Godot 4.7.2 Editor (Bypass C# iOS Block)
         if: steps.cache-godot.outputs.cache-hit != 'true'
+        shell: bash
         run: |
+          set -euo pipefail
           brew install scons
           mv godot-src /tmp/godot-src
-          python3 -c 'import glob; [open(p, "w", encoding="utf-8").writelines([l for l in open(p, encoding="utf-8", errors="ignore").read().splitlines(True) if "Exporting to an Apple Embedded platform is not supported" not in l]) for p in glob.glob("/tmp/godot-src/**", recursive=True) if p.endswith(".py")]'
+          python3 - <<'PY'
+          import glob
+
+          needle = "Exporting to an Apple Embedded platform is not supported"
+          patched = []
+          for p in glob.glob("/tmp/godot-src/**/*.py", recursive=True):
+              with open(p, encoding="utf-8", errors="ignore") as f:
+                  lines = f.read().splitlines(True)
+              kept = [l for l in lines if needle not in l]
+              if len(kept) != len(lines):
+                  with open(p, "w", encoding="utf-8") as f:
+                      f.writelines(kept)
+                  patched.append(p)
+          print("Patched files:", patched or "none (check is not in a .py file)")
+          PY
           cd /tmp/godot-src
-          scons platform=macos arch=x86_64 target=editor module_mono_enabled=yes vulkan=no angle=no accesskit=no -j$(sysctl -n hw.ncpu)
+          scons platform=macos arch=x86_64 target=editor module_mono_enabled=yes vulkan=no angle=no accesskit=no -j"$(sysctl -n hw.ncpu)"
           ./bin/godot.macos.editor.x86_64.mono --headless --generate-mono-glue modules/mono/glue
           python3 modules/mono/build_scripts/build_assemblies.py --godot-output-dir=./bin --godot-platform=macos
           mkdir -p ~/patched-godot
           cp -r ./bin/* ~/patched-godot/
 
       - name: Restore and Build C# Assembly
+        shell: bash
         run: |
-          CSPROJ=$(find Polytoria -name "*.csproj" | head -n 1)
-          if [ -n "$CSPROJ" ]; then
-            dotnet restore "$CSPROJ"
-            dotnet build "$CSPROJ" -c Release -p:DefineConstants="ALLOW_SELFHOST"
+          set -euo pipefail
+          CSPROJ=$(find Polytoria -name "*.csproj" | head -n 1 || true)
+          if [ -z "$CSPROJ" ]; then
+            echo "::error::No .csproj found under Polytoria"
+            exit 1
           fi
+          dotnet restore "$CSPROJ"
+          dotnet build "$CSPROJ" -c Release -p:DefineConstants="ALLOW_SELFHOST"
 
-      - name: Export iOS Project
+      - name: Export Godot Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          GODOT_BIN="$HOME/patched-godot/godot.macos.editor.x86_64.mono"
+          chmod +x "$GODOT_BIN"
+
+          mkdir -p "$IOS_DIR"
+
+          # The iOS project has to be named polyiphone.xcodeproj, so the plugins
+          # that need the full iOS exporter are dropped before importing.
+          sed -i '' -e '/PolytoriaExportPlugin/d' -e '/DeeplinkPlugin/d' Polytoria/project.godot
+
+          "$GODOT_BIN" --headless --path Polytoria --import
+          "$GODOT_BIN" --headless --verbose --path Polytoria --export-pack "iOS" "$IOS_DIR/godot_apple_embedded.pck"
+          test -f "$IOS_DIR/godot_apple_embedded.pck" || {
+            echo "::error::Godot did not generate godot_apple_embedded.pck"
+            exit 1
+          }
+
+      - name: Prepare Xcode Project From Template
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/build/ios"
-          TPL_DIR="$HOME/Library/Application Support/Godot/export_templates/4.7.2.stable.mono"
-          if [ ! -d "$TPL_DIR" ]; then
-            TPL_DIR="$HOME/Library/Application Support/Godot/export_templates/4.7.2.stable"
-          fi
-
-          rm -rf "$GITHUB_WORKSPACE/build/ios/tpl"
-          unzip -q "$TPL_DIR/ios.zip" -d "$GITHUB_WORKSPACE/build/ios/tpl"
-
-          TPL_PROJ=$(find "$GITHUB_WORKSPACE/build/ios/tpl" -maxdepth 2 -name "*.xcodeproj" | head -n 1)
-          if [ -z "$TPL_PROJ" ]; then
-            echo "::error::No .xcodeproj found in $TPL_DIR/ios.zip"
-            exit 1
-          fi
-
-          TPL_ROOT=$(dirname "$TPL_PROJ")
-          cp -R "$TPL_ROOT"/* "$GITHUB_WORKSPACE/build/ios/"
-          rm -rf "$GITHUB_WORKSPACE/build/ios/tpl"
-
-          if [ -d "$GITHUB_WORKSPACE/build/ios/godot_apple_embedded.xcodeproj" ] && [ ! -d "$GITHUB_WORKSPACE/build/ios/polyiphone.xcodeproj" ]; then
-            mv "$GITHUB_WORKSPACE/build/ios/godot_apple_embedded.xcodeproj" "$GITHUB_WORKSPACE/build/ios/polyiphone.xcodeproj"
-          fi
-
-          python3 - <<'PY'
-          import os
-          import re
-
-          root = os.path.join(os.environ["GITHUB_WORKSPACE"], "build/ios")
-          repl = {
-              "$name": "polyiphone",
-              "$binary": "godot_apple_embedded",
-              "$bundle_identifier": "com.yousef.polyiphone",
-              "$short_version": "1.0",
-              "$version": "1",
-              "$signature": "????",
-              "$team_id": "",
-              "$code_sign_identity_debug": "",
-              "$code_sign_identity_release": "",
-              "$code_sign_style_debug": "Automatic",
-              "$code_sign_style_release": "Automatic",
-              "$provisioning_profile_uuid_debug": "",
-              "$provisioning_profile_uuid_release": "",
-              "$provisioning_profile_specifier_debug": "",
-              "$provisioning_profile_specifier_release": "",
-              "$targeted_device_family": "1,2",
-              "$orientations": "<string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string>",
-              "$additional_plist_content": "",
-              "$godot_enabled_plugins": "",
-              "$os_deployment_target": "15.0",
-              "$sdkroot": "iphoneos",
-              "$godot_archs": "arm64",
-              "$valid_archs": "arm64",
-              "$linker_flags": "",
-              "$additional_pbx_files": "",
-              "$additional_pbx_frameworks_build": "",
-              "$additional_pbx_frameworks_refs": "",
-              "$additional_pbx_resources_build": "",
-              "$additional_pbx_resources_refs": "",
-              "$modules_buildfile": "",
-              "$modules_buildgrp": "",
-              "$modules_buildphase": "",
-              "$modules_fileref": "",
-              "$moltenvk_buildfile": "",
-              "$moltenvk_buildgrp": "",
-              "$moltenvk_buildphase": "",
-              "$moltenvk_fileref": "",
-              "$pbx_embeded_frameworks": "",
-              "$pbx_launch_screen_build_phase": "",
-              "$pbx_launch_screen_build_reference": "",
-              "$pbx_launch_screen_copy_files": "",
-              "$pbx_launch_screen_file_reference": "",
-              "$pbx_locale_build_reference": "",
-              "$pbx_locale_file_reference": "",
-          }
-
-          ordered_keys = sorted(repl.keys(), key=len, reverse=True)
-
-          exts = (".pbxproj", ".plist", ".xcscheme", ".xcworkspacedata")
-          for dp, _, fns in os.walk(root):
-              for fn in fns:
-                  if fn.endswith(exts):
-                      path = os.path.join(dp, fn)
-                      with open(path, "r", encoding="utf-8", errors="strict") as f:
-                          txt = f.read()
-                      for k in ordered_keys:
-                          txt = txt.replace(k, repl[k])
-                      if fn.endswith(".pbxproj"):
-                          # Fix bare '15.0' lines missing 'IPHONEOS_DEPLOYMENT_TARGET = ' and ';'
-                          txt = re.sub(r"(?m)^([ \t]*)15\.0[ \t]*$", r"\1IPHONEOS_DEPLOYMENT_TARGET = 15.0;", txt)
-                          # Fix empty '= ;' assignments in OpenStep syntax
-                          txt = re.sub(r"=\s*;", '= "";', txt)
-                      with open(path, "w", encoding="utf-8") as f:
-                          f.write(txt)
-
-          godot_proj = os.path.join(os.environ["GITHUB_WORKSPACE"], "Polytoria/project.godot")
-          if os.path.exists(godot_proj):
-              with open(godot_proj, "r", encoding="utf-8", errors="ignore") as f:
-                  lines = f.readlines()
-              filtered = [ln for ln in lines if "PolytoriaExportPlugin" not in ln and "DeeplinkPlugin" not in ln]
-              with open(godot_proj, "w", encoding="utf-8") as f:
-                  f.writelines(filtered)
-          PY
-
-          xcodebuild -list -project "$GITHUB_WORKSPACE/build/ios/polyiphone.xcodeproj"
-
-          ~/patched-godot/godot.macos.editor.x86_64.mono --headless --path Polytoria --import
-          ~/patched-godot/godot.macos.editor.x86_64.mono --headless --verbose --path Polytoria --export-pack "iOS" "$GITHUB_WORKSPACE/build/ios/godot_apple_embedded.pck"
-          test -f "$GITHUB_WORKSPACE/build/ios/godot_apple_embedded.pck" || {
-            echo "::error::Godot did not generate godot_apple_embedded.pck"
-            exit 1
-          }
-          
-      - name: Build Unsigned IPA
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/build/ios"
-          PROJ_FILE=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
-          if [ -z "$PROJ_FILE" ]; then echo "ERROR: No .xcodeproj"; exit 1; fi
-
-          TPL_DIR="$HOME/Library/Application Support/Godot/export_templates/4.7.2.stable.mono"
-          if [ ! -d "$TPL_DIR" ]; then
-            TPL_DIR="$HOME/Library/Application Support/Godot/export_templates/4.7.2.stable"
-          fi
-
-          mkdir -p /tmp/ios_tpl_check
-          unzip -qo "$TPL_DIR/ios.zip" -d /tmp/ios_tpl_check 2>/dev/null || true
-
-          echo "=== Files in $TPL_DIR ==="
-          ls -la "$TPL_DIR" || true
-
-          echo "=== All .xcframework / .a / .dylib in tpl and TPL_DIR ==="
-          find /tmp/ios_tpl_check "$TPL_DIR" -maxdepth 5 \( -name "*.xcframework" -o -name "*.a" -o -name "*.dylib" \) || true
-
-          # Prefer an xcframework that contains an ios slice (not visionos)
-          FOUND_XCFW=""
-          for cand in $(find /tmp/ios_tpl_check "$TPL_DIR" -maxdepth 5 -name "*.xcframework" || true); do
-            if [ -f "$cand/Info.plist" ] && grep -qi "ios" "$cand/Info.plist"; then
-              FOUND_XCFW="$cand"
-              break
-            fi
+          TPL_ZIP=""
+          for d in "$HOME/Library/Application Support/Godot/export_templates/${GODOT_TEMPLATE_TAG}.mono" \
+                   "$HOME/Library/Application Support/Godot/export_templates/${GODOT_TEMPLATE_TAG}"; do
+            if [ -f "$d/ios.zip" ]; then TPL_ZIP="$d/ios.zip"; break; fi
           done
-
-          if [ -n "$FOUND_XCFW" ]; then
-            rm -rf "$PWD/godot_apple_embedded.xcframework"
-            echo "Copying iOS XCFramework from: $FOUND_XCFW"
-            cp -R "$FOUND_XCFW" "$PWD/godot_apple_embedded.xcframework"
-          else
-            echo "::error::No iOS .xcframework found in $TPL_DIR or ios.zip"
+          if [ -z "$TPL_ZIP" ]; then
+            echo "::error::ios.zip not found in the Godot export templates directory"
+            ls -la "$HOME/Library/Application Support/Godot/export_templates/" || true
             exit 1
           fi
-          
-      - name: Package Unsigned IPA
+          echo "Using $TPL_ZIP"
+
+          rm -rf /tmp/ios_tpl
+          mkdir -p /tmp/ios_tpl
+          unzip -q "$TPL_ZIP" -d /tmp/ios_tpl
+
+          TPL_PROJ=$(find /tmp/ios_tpl -maxdepth 2 -name "*.xcodeproj" | head -n 1 || true)
+          if [ -z "$TPL_PROJ" ]; then
+            echo "::error::No .xcodeproj inside ios.zip"
+            find /tmp/ios_tpl -maxdepth 3 | head -n 80 || true
+            exit 1
+          fi
+          TPL_ROOT=$(dirname "$TPL_PROJ")
+
+          # Copy everything, dotfiles included, without clobbering the pck.
+          cp -R "$TPL_ROOT"/. "$IOS_DIR"/
+
+          if [ -d "$IOS_DIR/godot_apple_embedded.xcodeproj" ] && [ ! -d "$IOS_DIR/polyiphone.xcodeproj" ]; then
+            mv "$IOS_DIR/godot_apple_embedded.xcodeproj" "$IOS_DIR/polyiphone.xcodeproj"
+          fi
+          test -d "$IOS_DIR/polyiphone.xcodeproj"
+
+          python3 "$GITHUB_WORKSPACE/.github/scripts/fill_ios_template.py" "$IOS_DIR"
+
+          # The engine library: pick the iOS *release* xcframework explicitly.
+          # Never pick MoltenVK or the debug build by accident.
+          echo "xcframeworks shipped in ios.zip:"
+          find /tmp/ios_tpl -maxdepth 3 -name "*.xcframework" -print
+
+          FOUND_XCFW=""
+          for pat in "libgodot.ios.release.xcframework" \
+                     "libgodot.ios.template_release.xcframework" \
+                     "*ios*release*.xcframework"; do
+            FOUND_XCFW=$(find /tmp/ios_tpl -maxdepth 3 -type d -name "$pat" ! -iname "*moltenvk*" ! -iname "*debug*" | head -n 1 || true)
+            if [ -n "$FOUND_XCFW" ]; then break; fi
+          done
+          if [ -z "$FOUND_XCFW" ]; then
+            echo "::error::No iOS release .xcframework found in ios.zip"
+            exit 1
+          fi
+          echo "Using engine library: $FOUND_XCFW"
+          rm -rf "$IOS_DIR/godot_apple_embedded.xcframework"
+          cp -R "$FOUND_XCFW" "$IOS_DIR/godot_apple_embedded.xcframework"
+
+          xcodebuild -list -project "$IOS_DIR/polyiphone.xcodeproj"
+
+      # WKWebView browser + polytoria:// hand-off used by PolyTouchControls.cs.
+      # Non-fatal: if it fails to compile the IPA is still built (with a warning).
+      - name: Build Native iOS Bridge
+        id: native
+        continue-on-error: true
+        shell: bash
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE/build/ios"
-          PROJ_FILE=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
-          if [ -z "$PROJ_FILE" ]; then
-            echo "::error::No .xcodeproj found in $PWD"
-            exit 1
+          cd "$IOS_DIR"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -miphoneos-version-min=15.0 \
+            -fobjc-arc -O2 -Wall \
+            -c "$GITHUB_WORKSPACE/.github/native/polyiphone_native.m" \
+            -o polyiphone_native.o
+          xcrun libtool -static -o libpolyiphone_native.a polyiphone_native.o
+          xcrun lipo -info libpolyiphone_native.a
+          nm -gU libpolyiphone_native.a | grep -E "poly_(show|hide)_polydroid_web|poly_pop_deeplink"
+
+      - name: Warn If Native Bridge Failed
+        if: steps.native.outcome != 'success'
+        shell: bash
+        run: echo "::warning::Native iOS bridge failed to build; the in-app Polytoria browser will fall back to Safari."
+
+      - name: Compile iOS Binary (goes inside the IPA)
+        shell: bash
+        env:
+          NATIVE_OK: ${{ steps.native.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          cd "$IOS_DIR"
+
+          test -d godot_apple_embedded.xcframework
+          test -f godot_apple_embedded.pck
+
+          # Link the native bridge (and WebKit) only when it was built.
+          LD_EXTRA='$(inherited)'
+          if [ "$NATIVE_OK" = "true" ] && [ -f "$IOS_DIR/libpolyiphone_native.a" ]; then
+            LD_EXTRA="$LD_EXTRA -framework WebKit -framework UIKit -Wl,-u,_poly_show_polydroid_web -Wl,-u,_poly_hide_polydroid_web -Wl,-u,_poly_pop_deeplink $IOS_DIR/libpolyiphone_native.a"
           fi
+          echo "OTHER_LDFLAGS=$LD_EXTRA"
 
-          APPICON_DIR="$PWD/godot_apple_embedded/Images.xcassets/AppIcon.appiconset"
-          mkdir -p "$APPICON_DIR"
-          APPICON_DIR="$APPICON_DIR" python3 - <<'PY'
-          import os, struct, zlib
+          # actool needs an app icon set named AppIcon; write one into every
+          # asset catalog of the project.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/make_app_icon.py" "$PWD"
 
-          out_dir = os.environ["APPICON_DIR"]
+          rm -rf build_out Payload polyiphone.ipa
+          mkdir -p "$GITHUB_WORKSPACE/build"
 
-          def make_png(w, h):
-              def chunk(tag, data):
-                  crc = zlib.crc32(tag + data) & 0xffffffff
-                  return struct.pack("!I", len(data)) + tag + data + struct.pack("!I", crc)
-              raw = b"".join(b"\x00" + b"\x20\x60\xc0\xff" * w for _ in range(h))
-              ihdr = struct.pack("!IIBBBBB", w, h, 8, 6, 0, 0, 0)
-              return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
-
-          with open(os.path.join(out_dir, "icon_1024.png"), "wb") as f:
-              f.write(make_png(1024, 1024))
-
-          contents = """{
-            "images" : [
-              {
-                "filename" : "icon_1024.png",
-                "idiom" : "universal",
-                "platform" : "ios",
-                "size" : "1024x1024"
-              }
-            ],
-            "info" : {
-              "author" : "xcode",
-              "version" : 1
-            }
-          }
-          """
-          with open(os.path.join(out_dir, "Contents.json"), "w", encoding="utf-8") as f:
-              f.write(contents)
-          PY
-
-          rm -rf build_out Payload
           xcodebuild build \
-            -project "$PROJ_FILE" \
+            -project polyiphone.xcodeproj \
             -alltargets \
             -configuration Release \
             -sdk iphoneos \
-            -arch arm64 \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
             CONFIGURATION_BUILD_DIR="$PWD/build_out" \
+            ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon \
+            OTHER_LDFLAGS="$LD_EXTRA" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build/xcodebuild.log"
 
-          APP_PATH=$(find build_out -maxdepth 2 -name "*.app" | head -n 1)
+      - name: Package Unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$IOS_DIR"
+
+          APP_PATH=$(find build_out -maxdepth 1 -name "*.app" -type d | head -n 1 || true)
           if [ -z "$APP_PATH" ]; then
             echo "::error::No .app produced in build_out"
+            ls -la build_out || true
             exit 1
           fi
 
-          if [ -f godot_apple_embedded.pck ]; then
-            cp godot_apple_embedded.pck "$APP_PATH/"
-          fi
+          cp godot_apple_embedded.pck "$APP_PATH/"
+          rm -rf "$APP_PATH/_CodeSignature"
 
-          mkdir -p Payload
+          # Sanity checks: the executable exists and is arm64.
+          EXE_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist")
+          test -f "$APP_PATH/$EXE_NAME"
+          lipo -info "$APP_PATH/$EXE_NAME" | tee /tmp/lipo.txt
+          grep -q arm64 /tmp/lipo.txt
+
+          rm -rf Payload
+          mkdir Payload
           cp -R "$APP_PATH" Payload/
-          zip -qry "$GITHUB_WORKSPACE/build/ios/polyiphone.ipa" Payload
-          rm -rf Payload build_out
-          test -f "$GITHUB_WORKSPACE/build/ios/polyiphone.ipa"
-          ls -lh "$GITHUB_WORKSPACE/build/ios/polyiphone.ipa"
-          
+          rm -f polyiphone.ipa
+          zip -qry polyiphone.ipa Payload
+          rm -rf Payload
+
+          unzip -tq polyiphone.ipa
+          # Write the listing to a file first: piping unzip into head under
+          # pipefail kills unzip with SIGPIPE and fails the step with exit 141.
+          unzip -l polyiphone.ipa > /tmp/ipa_listing.txt
+          head -n 15 /tmp/ipa_listing.txt
+          ls -lh polyiphone.ipa
+
       - name: Upload polyiphone.ipa
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: polyiphone-ipa
           path: build/ios/polyiphone.ipa
           if-no-files-found: error
+
+      - name: Upload Build Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: polyiphone-build-logs
+          path: build/xcodebuild.log
+          if-no-files-found: ignore
