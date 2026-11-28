@@ -308,9 +308,35 @@ public partial class PolyTouchControls : CanvasLayer
 	private void OpenWeb()
 	{
 		if (OS.GetName() == "iOS")
-			poly_show_polydroid_web();
-		else
-			OS.ShellOpen("https://polytoria.com");
+		{
+			try
+			{
+				poly_show_polydroid_web();
+				return;
+			}
+			catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException)
+			{
+				// Native WKWebView bridge missing: fall back to Safari instead of crashing.
+				GD.PrintErr("polyiphone: native web view unavailable: " + e.Message);
+			}
+		}
+
+		OS.ShellOpen("https://polytoria.com");
+	}
+
+	private static void HideWeb()
+	{
+		if (OS.GetName() != "iOS")
+			return;
+
+		try
+		{
+			poly_hide_polydroid_web();
+		}
+		catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException)
+		{
+			// Nothing to hide when the native bridge is missing.
+		}
 	}
 
 	public override void _Process(double delta)
@@ -354,12 +380,8 @@ public partial class PolyTouchControls : CanvasLayer
 		if (token.StartsWith("join/", StringComparison.OrdinalIgnoreCase))
 			token = token.Substring(5);
 
-		_launcher.Visible = false;
-		_settings.Visible = false;
-
-		if (OS.GetName() == "iOS")
-			poly_hide_polydroid_web();
-
+		// Look the game entry up first. Hiding the launcher/browser before this
+		// would leave a blank screen if the entry cannot be found.
 		Node entry = FindEntry(GetTree().Root);
 		MethodInfo method = entry?.GetType().GetMethod(
 			"Entry",
@@ -368,7 +390,10 @@ public partial class PolyTouchControls : CanvasLayer
 
 		ParameterInfo[] parameters = method?.GetParameters();
 		if (entry == null || method == null || parameters == null || parameters.Length != 1)
+		{
+			GD.PrintErr("polyiphone: ClientEntry.Entry(...) not found; keeping the launcher open.");
 			return;
+		}
 
 		Type dataType = Nullable.GetUnderlyingType(parameters[0].ParameterType)
 			?? parameters[0].ParameterType;
@@ -376,7 +401,20 @@ public partial class PolyTouchControls : CanvasLayer
 		object data = Activator.CreateInstance(dataType);
 		dataType.GetField("Token")?.SetValue(data, token);
 		dataType.GetProperty("Token")?.SetValue(data, token);
-		method.Invoke(entry, new[] { data });
+
+		_launcher.Visible = false;
+		_settings.Visible = false;
+		HideWeb();
+
+		try
+		{
+			method.Invoke(entry, new[] { data });
+		}
+		catch (TargetInvocationException e)
+		{
+			GD.PrintErr("polyiphone: failed to start the game: " + e.InnerException?.Message);
+			_launcher.Visible = true;
+		}
 	}
 
 	private static Node FindEntry(Node node)
@@ -394,23 +432,53 @@ public partial class PolyTouchControls : CanvasLayer
 		return null;
 	}
 
+	// Safe-area insets (left, top, right, bottom) in viewport units, so the HUD
+	// stays clear of the notch / Dynamic Island and the home indicator.
+	private static Vector4 GetSafeInsets(Vector2 viewportSize)
+	{
+		if (OS.GetName() != "iOS")
+			return Vector4.Zero;
+
+		Vector2I windowSize = DisplayServer.WindowGetSize();
+		Rect2I safe = DisplayServer.GetDisplaySafeArea();
+
+		if (windowSize.X <= 0 || windowSize.Y <= 0 || safe.Size.X <= 0 || safe.Size.Y <= 0)
+			return Vector4.Zero;
+
+		float scaleX = viewportSize.X / windowSize.X;
+		float scaleY = viewportSize.Y / windowSize.Y;
+
+		return new Vector4(
+			Mathf.Max(0, safe.Position.X) * scaleX,
+			Mathf.Max(0, safe.Position.Y) * scaleY,
+			Mathf.Max(0, windowSize.X - safe.End.X) * scaleX,
+			Mathf.Max(0, windowSize.Y - safe.End.Y) * scaleY
+		);
+	}
+
 	private void LayoutHud()
 	{
 		Vector2 viewportSize = GetViewport().GetVisibleRect().Size;
+		Vector4 inset = GetSafeInsets(viewportSize);
 
-		_jumpBtn.Position = new Vector2(viewportSize.X - 96f, viewportSize.Y - 96f);
-		_sprintBtn.Position = new Vector2(viewportSize.X - 180f, viewportSize.Y - 150f);
-		_eBtn.Position = new Vector2(viewportSize.X - 96f, viewportSize.Y - 190f);
-		_kbdBtn.Position = new Vector2(16f, 16f);
-		_polyTopBtn.Position = new Vector2(68f, 16f);
-		_fpsLabel.Position = new Vector2(176f, 22f);
-		_hotbarRow.Position = new Vector2((viewportSize.X - 144f) * 0.5f, viewportSize.Y - 62f);
+		float left = inset.X;
+		float top = inset.Y;
+		float right = viewportSize.X - inset.Z;
+		float bottom = viewportSize.Y - inset.W;
+
+		_jumpBtn.Position = new Vector2(right - 96f, bottom - 96f);
+		_sprintBtn.Position = new Vector2(right - 180f, bottom - 150f);
+		_eBtn.Position = new Vector2(right - 96f, bottom - 190f);
+		_kbdBtn.Position = new Vector2(left + 16f, top + 16f);
+		_polyTopBtn.Position = new Vector2(left + 68f, top + 16f);
+		_fpsLabel.Position = new Vector2(left + 176f, top + 22f);
+		_hotbarRow.Position = new Vector2((viewportSize.X - 144f) * 0.5f, bottom - 62f);
 
 		for (int i = 0; i < _customBtns.Count; i++)
 		{
 			_customBtns[i].Position = new Vector2(
-				viewportSize.X - 180f - (i * 58f),
-				viewportSize.Y - 215f
+				right - 180f - (i * 58f),
+				bottom - 215f
 			);
 		}
 	}
