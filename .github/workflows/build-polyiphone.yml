@@ -42,11 +42,10 @@ jobs:
           grep -A 5 '^\[autoload\]' Polytoria/project.godot
 
       - name: Patch Loading Screen (no "Waiting for server" screen)
-        shell: bash
         run: |
           set -euo pipefail
-          python3 .github/scripts/patch_loading_screen.py Polytoria/scripts/client/ui/UILoadingScreen.cs
-          if grep -rn "Waiting for server" Polytoria --include=*.cs --include=*.tscn; then
+          find Polytoria \( -name "*.cs" -o -name "*.tscn" \) -exec sed -i '' 's/Waiting for server\.\.\.//g; s/Waiting for server//g' {} +
+          if grep -rn "Waiting for server" Polytoria --include="*.cs" --include="*.tscn"; then
             echo "::error::'Waiting for server' text is still present"
             exit 1
           fi
